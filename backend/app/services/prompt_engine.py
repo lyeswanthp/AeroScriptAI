@@ -4,24 +4,22 @@ import re
 from app.models.modes import Mode
 from app.config import settings
 
+# ── System Prompt ───────────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT_BASE = """You are a sketch recognition assistant. The user draws things in the air with their hand — the drawings are hand-drawn, sparse, and imperfect. Focus on the overall shape and structure.
+SYSTEM_PROMPT_BASE = """You identify hand-drawn sketches made in the air. The drawings are imperfect, sparse strokes.
 
-Identify what was drawn and provide a brief, informative response. If it could be multiple things, mention the most likely interpretation.
-
-IMPORTANT: Rate your confidence in your identification by starting your response with a confidence tag:
-- [CONFIDENCE:high] — if you are certain what it is
-- [CONFIDENCE:medium] — if you have a reasonable guess but aren't certain
-- [CONFIDENCE:low] — if the drawing is unclear and you're guessing
-
-Be concise. 2-3 sentences maximum."""
+Rules:
+1. Name the subject FIRST — the first word(s) must be what you identified. Do not start with "The image presents" or "This is a drawing of".
+2. Keep your response to 1-2 short sentences maximum.
+3. If you cannot identify what it is, say "Unclear sketch" — do not guess wildly or use filler phrases.
+4. Do not use the phrase "simple yet" or "striking contrast" or "intriguing" — just describe what is actually drawn."""
 
 MODE_TEMPLATES = {
-    "OBJECT": "Focus on identifying objects, animals, plants, or manufactured items. Consider the overall silhouette, distinguishing features, and typical shapes.",
-    "GEOGRAPHY": "Look for country borders, continent shapes, landmarks, maps, or geographic features. Identify any recognizable landmass, body of water, or location.",
-    "MATH": "Parse this as a mathematical expression, equation, or diagram. Solve it if possible and show your reasoning.",
-    "TEXT": "This is handwriting — read and transcribe the text exactly as written. Pay attention to individual letters and their arrangement.",
-    "FREE": "Interpret freely — the user may have drawn anything. Go with your best guess based on the overall shape.",
+    "OBJECT": "Look for objects, animals, plants, or manufactured items. Identify the overall silhouette and key features. Be specific about what it is.",
+    "GEOGRAPHY": "Look for country borders, continent shapes, maps, or geographic features. Identify any recognizable landmass, body of water, or location.",
+    "MATH": "This is a math sketch. Parse the expression or diagram and solve it. Show your answer clearly.",
+    "TEXT": "This is handwriting. Read and transcribe the text exactly as written.",
+    "FREE": "Identify whatever the user drew. Be as specific as possible.",
 }
 
 HISTORY_INJECTION_TEMPLATE = """
@@ -61,19 +59,75 @@ def assemble_prompt(mode: Mode, user_message: str, history: list[dict]) -> list[
 
 def parse_confidence(text: str) -> str:
     """
-    Extract the confidence level from a response.
-    Returns 'high', 'medium', 'low', or 'unknown'.
+    Extract or infer confidence level from the response text.
+
+    Tries [CONFIDENCE:...] tag first (for backwards compat and future models).
+    Falls back to heuristic language analysis for LLaVA which ignores the tag.
     """
+    # Try explicit tag first
     match = re.search(r"\[CONFIDENCE:(\w+)\]", text, re.IGNORECASE)
     if match:
         level = match.group(1).lower()
         if level in ("high", "medium", "low"):
             return level
-    return "unknown"
+        return "unknown"
+
+    lower = text.lower()
+    words = set(lower.replace(",", " ").replace(".", " ").split())
+
+    # Explicit uncertainty — overrides everything
+    uncertain_signals = [
+        "unclear", "can't tell", "cannot tell", "hard to tell",
+        "not sure", "unsure", "unrecognizable", "i don't know",
+        "i'm not sure", "not certain", "too vague", "too abstract",
+        "difficult to identify", "hard to identify", "could be several",
+        "might be several", "appears to be several",
+    ]
+    if any(sig in lower for sig in uncertain_signals):
+        return "low"
+
+    # Hedging language — medium confidence
+    hedge_signals = [
+        "could be", "might be", "perhaps", "possibly",
+        "looks like", "looks a bit like", "resembles",
+        "might be a", "could be an", "possibly a",
+        "somewhat like", "vaguely", "partially",
+        "this could be", "it looks like a",
+    ]
+    hedge_count = sum(1 for sig in hedge_signals if sig in lower)
+
+    # Multiple alternatives — medium/low
+    alt_signals = ["or perhaps", "or maybe", "or it could", "or a", "alternatively"]
+    alt_count = sum(1 for sig in alt_signals if sig in lower)
+
+    if hedge_count >= 2 or alt_count >= 1:
+        return "medium"
+    if hedge_count >= 1:
+        return "medium"
+
+    # Strong certainty signals — high confidence
+    certain_signals = [
+        "this is a", "that is a", "it is a", "this looks like a",
+        "you drew a", "you drew an", "it appears to be",
+        "definitely", "clearly", "obviously",
+    ]
+    if any(sig in lower for sig in certain_signals):
+        return "high"
+
+    # Starts with identification (capitalized phrase followed by noun) — high
+    if re.search(r"^[A-Z][a-z]+ (is|looks?|appears?|seems?) ", text):
+        return "high"
+
+    # Short, direct responses are usually confident
+    if len(text) < 100:
+        return "high"
+
+    # Default to medium — most responses fall here
+    return "medium"
 
 
 def strip_confidence_tag(text: str) -> str:
-    """Remove the [CONFIDENCE:*] tag from the response text."""
+    """Remove the [CONFIDENCE:*] tag from the response text (backwards-compatible)."""
     return re.sub(r"\[CONFIDENCE:\w+\]\s*", "", text, flags=re.IGNORECASE).strip()
 
 

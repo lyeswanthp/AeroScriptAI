@@ -38,21 +38,48 @@ class TestAssemblePrompt:
 
 
 class TestParseConfidence:
-    def test_high_confidence(self):
-        assert parse_confidence("[CONFIDENCE:high] It's a cat.") == "high"
+    def test_definitive_statement_high(self):
+        # Direct identification = high confidence
+        assert parse_confidence("It is a cat.") == "high"
 
-    def test_medium_confidence(self):
-        assert parse_confidence("[CONFIDENCE:medium] Might be a dog.") == "medium"
+    def test_starts_with_capitalized_identification(self):
+        # Starts with capitalized phrase = high
+        assert parse_confidence("This is a dog.") == "high"
 
-    def test_low_confidence(self):
-        assert parse_confidence("[CONFIDENCE:low] Could be anything.") == "low"
+    def test_short_text_high(self):
+        # Short response = confident
+        assert parse_confidence("Circle.") == "high"
 
-    def test_case_insensitive(self):
-        assert parse_confidence("[Confidence:HIGH] text") == "high"
-        assert parse_confidence("[confidence:Low] text") == "low"
+    def test_hedge_language_medium(self):
+        # "looks like", "could be" = hedging = medium
+        assert parse_confidence("It looks like a dog.") == "medium"
+        assert parse_confidence("This could be a cat.") == "medium"
+        assert parse_confidence("That might be a bird.") == "medium"
 
-    def test_no_tag_returns_unknown(self):
-        assert parse_confidence("Just some text without a tag.") == "unknown"
+    def test_multiple_hedges_medium(self):
+        # Multiple hedges = definitely medium
+        assert parse_confidence("It could be a dog or maybe a fox.") == "medium"
+
+    def test_uncertain_language_low(self):
+        # Explicit uncertainty = low
+        assert parse_confidence("I cannot tell what this is.") == "low"
+        assert parse_confidence("Too vague and abstract to identify.") == "low"
+        assert parse_confidence("This is too unclear to say.") == "low"
+
+    def test_contains_both_hedge_and_certain(self):
+        # Hedge overrides certainty when explicitly uncertain words present
+        result = parse_confidence("I am not sure what this is, but it could be a tree.")
+        assert result == "low"
+
+    def test_long_verbose_text_medium(self):
+        # Long verbose text without certainty signals = medium
+        text = "The image presents a scene. There are shapes that could be interpreted in different ways."
+        assert parse_confidence(text) == "medium"
+
+    def test_no_tag_no_longer_returns_unknown(self):
+        # We no longer rely on [CONFIDENCE:...] tags
+        # Short text without tags is high confidence
+        assert parse_confidence("Circle.") == "high"
 
 
 class TestStripConfidenceTag:

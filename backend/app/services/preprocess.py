@@ -169,7 +169,7 @@ def thicken_strokes(img: Image.Image, iterations: int = 1) -> Image.Image:
     from PIL import ImageFilter
 
     for _ in range(iterations):
-        img = img.filter(ImageFilter.MinFilter(size=3))
+        img = img.filter(ImageFilter.MaxFilter(size=3))
 
     return img
 

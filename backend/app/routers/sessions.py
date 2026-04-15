@@ -117,8 +117,10 @@ async def _sse_stream_saving(
                 pass
         yield chunk
 
+    from app.services.response_cleaner import build_final_response
     full_response = "".join(collected).strip()
     if full_response:
+        full_response = build_final_response(full_response)
         session_manager.add_to_history(session_id, "assistant", full_response)
 
 
@@ -168,6 +170,9 @@ async def recognize_drawing(submission: DrawingSubmission) -> RecognitionRespons
     response_text = "".join(full_parts)
     confidence = prompt_engine.parse_confidence(response_text)
     response_text = prompt_engine.strip_confidence_tag(response_text)
+
+    from app.services.response_cleaner import build_final_response
+    response_text = build_final_response(response_text)
 
     session_manager.add_to_history(session_id, "assistant", response_text)
 
@@ -292,6 +297,9 @@ async def followup(message: FollowUpMessage) -> RecognitionResponse:
     response_text = "".join(full_parts)
     confidence = prompt_engine.parse_confidence(response_text)
     response_text = prompt_engine.strip_confidence_tag(response_text)
+
+    from app.services.response_cleaner import build_final_response
+    response_text = build_final_response(response_text)
 
     session_manager.add_to_history(message.session_id, "assistant", response_text)
 

@@ -23,7 +23,8 @@ const LANDMARKS = {
 
 const FINGER_EXTENDED_THRESHOLD = 0.06;
 const THUMB_EXTENDED_THRESHOLD = 0.04;
-const ERASE_RADIUS = 40; // px — area around palm center to erase
+const ERASE_RADIUS = 60; // px — area around palm center to erase
+const MIN_MOVEMENT_THRESHOLD = 8; // px — minimum movement before adding a point (reduces jitter)
 
 const HAND_CONNECTIONS: [number, number][] = [
   [0, 1], [1, 2], [2, 3], [3, 4],
@@ -38,7 +39,7 @@ function App() {
   const [mode, setMode] = useState<Mode>('free');
   const [gesture, setGesture] = useState<Gesture>('idle');
   const [strokeColor, setStrokeColor] = useState('#00e5ff');
-  const [strokeWidth, setStrokeWidth] = useState(3);
+  const [strokeWidth, setStrokeWidth] = useState(4);
   const [isConnected, setIsConnected] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isStreaming, setIsStreaming] = useState(false);
@@ -69,6 +70,7 @@ function App() {
   const isDrawingRef = useRef(false);
   const pipVideoRef = useRef<HTMLVideoElement>(null);
   const abortStreamRef = useRef<(() => void) | null>(null);
+  const isMirroredRef = useRef(true); // tracks whether video is mirrored (front camera)
   // Stable ref that always holds the latest onResults handler.
   // Avoids re-registering MediaPipe's onResults (and re-initializing the model)
   // every time a React callback changes.
@@ -182,7 +184,7 @@ function App() {
     const last = current.points[current.points.length - 1];
     const dx = point.x - last.x;
     const dy = point.y - last.y;
-    if (dx * dx + dy * dy < 64) return;
+    if (dx * dx + dy * dy < MIN_MOVEMENT_THRESHOLD * MIN_MOVEMENT_THRESHOLD) return;
     const updated = { ...current, points: [...current.points, point] };
     currentStrokeRef.current = updated;
     setCurrentStroke(updated);
@@ -253,9 +255,9 @@ function App() {
       ? (thumbTip.x < wrist.x - THUMB_EXTENDED_THRESHOLD && thumbTip.y < thumbIP.y)
       : (thumbTip.x < wrist.x - THUMB_EXTENDED_THRESHOLD);
 
-    const extendedCount = [indexExtended, middleExtended, ringExtended, pinkyExtended].filter(Boolean).length;
+    const extFingers = [indexExtended, middleExtended, ringExtended, pinkyExtended].filter(Boolean).length;
 
-    if (thumbExtended && !indexExtended && extendedCount === 0) {
+    if (thumbExtended && !indexExtended && extFingers === 0) {
       if (thumbsUpStartRef.current === null) {
         thumbsUpStartRef.current = Date.now();
       } else if (Date.now() - thumbsUpStartRef.current >= 2000) {
@@ -265,9 +267,13 @@ function App() {
       thumbsUpStartRef.current = null;
     }
 
-    if (indexExtended && middleExtended && ringExtended && pinkyExtended) return 'erase';
-    if (indexExtended && !middleExtended && !ringExtended && !pinkyExtended) return 'draw';
-    if (extendedCount === 0 && !thumbExtended) return 'idle';
+    // Open palm — at least 3 fingers extended (more tolerant than requiring ALL 4)
+    if (extFingers >= 3) return 'erase';
+    // Draw — index extended (other fingers can vary slightly)
+    if (indexExtended) return 'draw';
+    // Also allow draw when index is extended and only one other finger slightly extended (tolerant)
+    if (indexExtended && extFingers <= 2) return 'draw';
+    if (extFingers === 0 && !thumbExtended) return 'idle';
 
     return lastGestureRef.current;
   }, []);
@@ -387,35 +393,62 @@ function App() {
   const processHands = useCallback((lm: Array<{ x: number; y: number; z?: number }>, gesture: Gesture) => {
     const { width, height } = canvasSizeRef.current;
     const indexTip = lm[LANDMARKS.INDEX_TIP];
+
+    // Coordinate transform:
+    // MediaPipe normalizes coords to [0,1] from the video's perspective.
+    // Canvas also uses [0,1] normalized coords internally (via CSS size).
+    // When front camera is mirrored (CSS scaleX(-1)), the X axis is flipped:
+    // - The video is visually flipped horizontally
+    // - But the drawing canvas is NOT flipped
+    // So we need to map mirrored MediaPipe coords back to canvas space.
     if (indexTip && width > 0 && height > 0) {
-      lastIndexTipRef.current = { x: (1 - indexTip.x) * width, y: indexTip.y * height };
+      if (isMirroredRef.current) {
+        // Mirror: MediaPipe sees left side as x=0, but visually it's the RIGHT side on screen.
+        // Canvas draws at x=0 (left), but user sees video mirrored so their left (MediaPipe x=1) appears right.
+        // Correct: x_canvas = (1 - x_mediapipe) * width
+        lastIndexTipRef.current = { x: (1 - indexTip.x) * width, y: indexTip.y * height };
+      } else {
+        lastIndexTipRef.current = { x: indexTip.x * width, y: indexTip.y * height };
+      }
     }
 
     // Compute palm center (midpoint of wrist and middle finger MCP)
     const wrist = lm[LANDMARKS.WRIST];
     const middleMCP = lm[LANDMARKS.MIDDLE_MCP];
     if (wrist && middleMCP && width > 0 && height > 0) {
-      palmCenterRef.current = {
-        x: (1 - (wrist.x + middleMCP.x) / 2) * width,
-        y: ((wrist.y + middleMCP.y) / 2) * height,
-      };
+      if (isMirroredRef.current) {
+        palmCenterRef.current = {
+          x: (1 - (wrist.x + middleMCP.x) / 2) * width,
+          y: ((wrist.y + middleMCP.y) / 2) * height,
+        };
+      } else {
+        palmCenterRef.current = {
+          x: ((wrist.x + middleMCP.x) / 2) * width,
+          y: ((wrist.y + middleMCP.y) / 2) * height,
+        };
+      }
     }
 
     const prevGesture = lastGestureRef.current;
     lastGestureRef.current = gesture;
     setGesture(gesture);
 
-    if (gesture === 'draw' && prevGesture !== 'draw') {
-      if (lastIndexTipRef.current) {
+    if (gesture === 'draw') {
+      if (prevGesture !== 'draw' && lastIndexTipRef.current) {
         startStroke(lastIndexTipRef.current, strokeColor, strokeWidth);
+      } else if (lastIndexTipRef.current && isDrawingRef.current) {
+        addPoint(lastIndexTipRef.current);
       }
-    } else if (gesture === 'draw' && lastIndexTipRef.current && isDrawingRef.current) {
-      addPoint(lastIndexTipRef.current);
-    } else if (gesture === 'idle' && isDrawingRef.current) {
+    } else if (isDrawingRef.current) {
       endStroke();
-    } else if (gesture === 'erase' && palmCenterRef.current) {
+    }
+
+    // Erase continuously while hand is in erase mode (every frame)
+    if (gesture === 'erase' && palmCenterRef.current) {
       eraseNearPoint(palmCenterRef.current);
-    } else if (gesture === 'submit' && prevGesture !== 'submit') {
+    }
+
+    if (gesture === 'submit' && prevGesture !== 'submit') {
       handleSubmit();
     }
   }, [strokeColor, strokeWidth, startStroke, addPoint, endStroke, eraseNearPoint, handleSubmit]);
@@ -547,21 +580,24 @@ function App() {
     };
   }, []);
 
-  // ── Video frame loop (~30 fps) ────────────────────────────────────────────────
+  // ── Video frame loop ─────────────────────────────────────────────────────────
   useEffect(() => {
     if (!cameraReady || !handsReady) return;
 
     let animFrame: number;
     let lastTime = 0;
-    const interval = 1000 / 30;
+    let processing = false; // prevent frame backlog — wait for previous send() to finish
+    const interval = 1000 / 20; // cap at 20 fps to reduce CPU load
 
     const processFrame = async (timestamp: number) => {
-      if (timestamp - lastTime >= interval) {
+      if (timestamp - lastTime >= interval && !processing) {
         lastTime = timestamp;
         if (videoRef.current && handsInstanceRef.current && videoRef.current.readyState >= 2) {
+          processing = true;
           try {
             await handsInstanceRef.current.send({ image: videoRef.current });
           } catch { /* ignore */ }
+          processing = false;
         }
       }
       animFrame = requestAnimationFrame(processFrame);

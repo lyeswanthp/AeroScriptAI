@@ -7,7 +7,7 @@ class Settings(BaseSettings):
     # LM Studio connection
     lm_studio_host: str = "localhost"
     lm_studio_port: int = 1234
-    model_name: str = "llava-llama-3-8b-v1_1"
+    model_name: str = "qwen2.5-vl-7b"
 
     # Session management
     max_history_length: int = 20
@@ -20,7 +20,7 @@ class Settings(BaseSettings):
 
     # Inference
     request_timeout_seconds: int = 120
-    max_tokens: int = 500
+    max_tokens: int = 150
 
     # CORS
     frontend_origin: str = "http://localhost:5173"
