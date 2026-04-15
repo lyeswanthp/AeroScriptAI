@@ -2,6 +2,8 @@ export type Gesture = 'idle' | 'draw' | 'erase' | 'submit';
 
 export type Mode = 'free' | 'object' | 'geography' | 'math';
 
+export type ConfidenceLevel = 'high' | 'medium' | 'low' | 'unknown';
+
 export interface Point {
   x: number;
   y: number;
@@ -33,6 +35,8 @@ export interface ProcessedImage {
 export interface ConversationMessage {
   role: 'user' | 'assistant';
   content: string;
+  /** True when the user message represents a drawing submission, not typed text. */
+  isDrawing?: boolean;
   timestamp: number;
 }
 

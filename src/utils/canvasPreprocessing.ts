@@ -15,8 +15,20 @@ export function preprocessCanvas(
   const tempCanvas = document.createElement('canvas');
   const ctx = tempCanvas.getContext('2d')!;
 
-  const allPoints = strokes.flatMap((s) => s.points);
-  if (allPoints.length === 0) {
+  // Compute bounding box without intermediate arrays (avoids stack overflow on many points)
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  let totalPoints = 0;
+  for (const s of strokes) {
+    for (const p of s.points) {
+      if (p.x < minX) minX = p.x;
+      if (p.x > maxX) maxX = p.x;
+      if (p.y < minY) minY = p.y;
+      if (p.y > maxY) maxY = p.y;
+      totalPoints++;
+    }
+  }
+
+  if (totalPoints === 0) {
     tempCanvas.width = 512;
     tempCanvas.height = 512;
     ctx.fillStyle = '#ffffff';
@@ -24,11 +36,6 @@ export function preprocessCanvas(
     const dataUrl = tempCanvas.toDataURL('image/png');
     return { dataUrl, base64: dataUrl.split(',')[1] || '' };
   }
-
-  const minX = Math.min(...allPoints.map((p) => p.x));
-  const maxX = Math.max(...allPoints.map((p) => p.x));
-  const minY = Math.min(...allPoints.map((p) => p.y));
-  const maxY = Math.max(...allPoints.map((p) => p.y));
 
   const padding = 0.15;
   const width = maxX - minX;
@@ -55,21 +62,24 @@ export function preprocessCanvas(
   const scaleY = outputSize / cropHeight;
   const scale = Math.min(scaleX, scaleY);
 
+  // Center the drawing in the output square
+  const offsetX = (outputSize - cropWidth * scale) / 2;
+  const offsetY = (outputSize - cropHeight * scale) / 2;
+
   strokes.forEach((stroke) => {
     if (stroke.points.length < 2) return;
 
+    const smoothed = smoothPoints(stroke.points);
     const minWidth = Math.max(4, stroke.width * scale);
     ctx.lineWidth = minWidth;
     ctx.lineCap = 'round';
     ctx.lineJoin = 'round';
 
     ctx.beginPath();
-    const firstPoint = stroke.points[0];
-    ctx.moveTo((firstPoint.x - cropX) * scale, (firstPoint.y - cropY) * scale);
+    ctx.moveTo((smoothed[0].x - cropX) * scale + offsetX, (smoothed[0].y - cropY) * scale + offsetY);
 
-    for (let i = 1; i < stroke.points.length; i++) {
-      const point = stroke.points[i];
-      ctx.lineTo((point.x - cropX) * scale, (point.y - cropY) * scale);
+    for (let i = 1; i < smoothed.length; i++) {
+      ctx.lineTo((smoothed[i].x - cropX) * scale + offsetX, (smoothed[i].y - cropY) * scale + offsetY);
     }
     ctx.stroke();
   });

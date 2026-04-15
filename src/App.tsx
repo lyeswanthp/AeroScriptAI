@@ -4,7 +4,8 @@ import { Toolbar } from './components/Toolbar';
 import { GestureIndicator } from './components/GestureIndicator';
 import { PredictionPanel } from './components/PredictionPanel';
 import { ResponsePanel } from './components/ResponsePanel';
-import type { Gesture, Mode, CNNPrediction, Point, Stroke } from './types';
+import { checkHealth, streamRecognition, streamFollowUp } from './utils/api';
+import type { Gesture, Mode, CNNPrediction, Point, Stroke, ConversationMessage, ConfidenceLevel } from './types';
 
 const LANDMARKS = {
   WRIST: 0,
@@ -22,6 +23,7 @@ const LANDMARKS = {
 
 const FINGER_EXTENDED_THRESHOLD = 0.06;
 const THUMB_EXTENDED_THRESHOLD = 0.04;
+const ERASE_RADIUS = 40; // px — area around palm center to erase
 
 const HAND_CONNECTIONS: [number, number][] = [
   [0, 1], [1, 2], [2, 3], [3, 4],
@@ -37,14 +39,18 @@ function App() {
   const [gesture, setGesture] = useState<Gesture>('idle');
   const [strokeColor, setStrokeColor] = useState('#00e5ff');
   const [strokeWidth, setStrokeWidth] = useState(3);
-  const [isConnected] = useState(false);
+  const [isConnected, setIsConnected] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [isStreaming, setIsStreaming] = useState(false);
   const [predictions] = useState<CNNPrediction[]>([]);
-  const [responseText, setResponseText] = useState('');
-  const [isStreaming] = useState(false);
   const [cameraReady, setCameraReady] = useState(false);
   const [handsReady, setHandsReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // Conversation state
+  const [messages, setMessages] = useState<ConversationMessage[]>([]);
+  const [sessionId, setSessionId] = useState<string | null>(null);
+  const [confidence, setConfidence] = useState<ConfidenceLevel | null>(null);
 
   // Drawing state
   const [strokes, setStrokes] = useState<Stroke[]>([]);
@@ -61,8 +67,34 @@ function App() {
   const canvasSizeRef = useRef({ width: 0, height: 0 });
   const handsInstanceRef = useRef<any>(null);
   const isDrawingRef = useRef(false);
+  const pipVideoRef = useRef<HTMLVideoElement>(null);
+  const abortStreamRef = useRef<(() => void) | null>(null);
+  // Stable ref that always holds the latest onResults handler.
+  // Avoids re-registering MediaPipe's onResults (and re-initializing the model)
+  // every time a React callback changes.
+  const onResultsRef = useRef<(results: any) => void>(() => {});
+  // Mutable ref for the in-progress stroke so endStroke doesn't close over state.
+  const currentStrokeRef = useRef<Stroke | null>(null);
+  const palmCenterRef = useRef<Point | null>(null);
 
-  // Draw hand skeleton
+  // ── Health check ────────────────────────────────────────────────────────────
+  useEffect(() => {
+    let mounted = true;
+
+    const doCheck = async () => {
+      const ok = await checkHealth();
+      if (mounted) setIsConnected(ok);
+    };
+
+    doCheck();
+    const id = setInterval(doCheck, 15_000);
+    return () => {
+      mounted = false;
+      clearInterval(id);
+    };
+  }, []);
+
+  // ── Drawing helpers ──────────────────────────────────────────────────────────
   const drawHandSkeleton = useCallback((
     ctx: CanvasRenderingContext2D,
     lm: Array<{ x: number; y: number; z?: number }>
@@ -89,15 +121,12 @@ function App() {
     });
   }, []);
 
-  // Render all strokes to canvas
   const renderStrokes = useCallback(() => {
     const canvas = mainCanvasRef.current;
     if (!canvas) return;
-
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    // Set canvas size
     const rect = canvas.getBoundingClientRect();
     if (canvas.width !== rect.width || canvas.height !== rect.height) {
       canvas.width = rect.width;
@@ -106,7 +135,6 @@ function App() {
 
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-    // Render completed strokes
     strokes.forEach(stroke => {
       if (stroke.points.length < 2) return;
       ctx.beginPath();
@@ -124,7 +152,6 @@ function App() {
       ctx.stroke();
     });
 
-    // Render current stroke
     if (currentStroke && currentStroke.points.length >= 2) {
       ctx.beginPath();
       ctx.strokeStyle = currentStroke.color;
@@ -142,29 +169,34 @@ function App() {
     }
   }, [strokes, currentStroke]);
 
-  // Drawing functions
   const startStroke = useCallback((point: Point, color: string, width: number) => {
-    setCurrentStroke({ points: [point], color, width });
+    const stroke = { points: [point], color, width };
+    currentStrokeRef.current = stroke;
+    setCurrentStroke(stroke);
     isDrawingRef.current = true;
   }, []);
 
   const addPoint = useCallback((point: Point) => {
-    setCurrentStroke(prev => {
-      if (!prev) return null;
-      const dx = point.x - prev.points[prev.points.length - 1].x;
-      const dy = point.y - prev.points[prev.points.length - 1].y;
-      if (Math.sqrt(dx * dx + dy * dy) < 8) return prev;
-      return { ...prev, points: [...prev.points, point] };
-    });
+    const current = currentStrokeRef.current;
+    if (!current) return;
+    const last = current.points[current.points.length - 1];
+    const dx = point.x - last.x;
+    const dy = point.y - last.y;
+    if (dx * dx + dy * dy < 64) return;
+    const updated = { ...current, points: [...current.points, point] };
+    currentStrokeRef.current = updated;
+    setCurrentStroke(updated);
   }, []);
 
   const endStroke = useCallback(() => {
-    if (currentStroke && currentStroke.points.length > 1) {
-      setStrokes(prev => [...prev.slice(-49), currentStroke]);
+    const stroke = currentStrokeRef.current;
+    if (stroke && stroke.points.length > 1) {
+      setStrokes(prev => [...prev.slice(-49), stroke]);
     }
+    currentStrokeRef.current = null;
     setCurrentStroke(null);
     isDrawingRef.current = false;
-  }, [currentStroke]);
+  }, []);
 
   const undo = useCallback(() => {
     setStrokes(prev => prev.slice(0, -1));
@@ -174,9 +206,30 @@ function App() {
     setStrokes([]);
     setCurrentStroke(null);
     isDrawingRef.current = false;
+    // Cancel any in-flight stream and reset session
+    if (abortStreamRef.current) {
+      abortStreamRef.current();
+      abortStreamRef.current = null;
+    }
+    setMessages([]);
+    setSessionId(null);
+    setConfidence(null);
+    setIsStreaming(false);
+    setIsSubmitting(false);
   }, []);
 
-  // Gesture classification
+  const eraseNearPoint = useCallback((center: Point) => {
+    setStrokes(prev => prev.filter(stroke => {
+      for (const p of stroke.points) {
+        const dx = p.x - center.x;
+        const dy = p.y - center.y;
+        if (dx * dx + dy * dy < ERASE_RADIUS * ERASE_RADIUS) return false;
+      }
+      return true;
+    }));
+  }, []);
+
+  // ── Gesture classification ───────────────────────────────────────────────────
   const classifyGesture = useCallback((lm: Array<{ x: number; y: number; z?: number }>) => {
     const wrist = lm[LANDMARKS.WRIST];
     const thumbTip = lm[LANDMARKS.THUMB_TIP];
@@ -196,7 +249,9 @@ function App() {
     const middleExtended = middleTip && middleMCP ? middleTip.y < middleMCP.y - FINGER_EXTENDED_THRESHOLD : false;
     const ringExtended = ringTip && ringMCP ? ringTip.y < ringMCP.y - FINGER_EXTENDED_THRESHOLD : false;
     const pinkyExtended = pinkyTip && pinkyMCP ? pinkyTip.y < pinkyMCP.y - FINGER_EXTENDED_THRESHOLD : false;
-    const thumbExtended = thumbIP ? (thumbTip.x < wrist.x - THUMB_EXTENDED_THRESHOLD && thumbTip.y < thumbIP.y) : (thumbTip.x < wrist.x - THUMB_EXTENDED_THRESHOLD);
+    const thumbExtended = thumbIP
+      ? (thumbTip.x < wrist.x - THUMB_EXTENDED_THRESHOLD && thumbTip.y < thumbIP.y)
+      : (thumbTip.x < wrist.x - THUMB_EXTENDED_THRESHOLD);
 
     const extendedCount = [indexExtended, middleExtended, ringExtended, pinkyExtended].filter(Boolean).length;
 
@@ -217,33 +272,139 @@ function App() {
     return lastGestureRef.current;
   }, []);
 
+  // ── Submit drawing ───────────────────────────────────────────────────────────
   const handleSubmit = useCallback(async () => {
     if (strokes.length === 0 || isSubmitting) return;
+
     setIsSubmitting(true);
+    setConfidence(null);
+
+    // Cancel any previous in-flight request
+    if (abortStreamRef.current) {
+      abortStreamRef.current();
+      abortStreamRef.current = null;
+    }
 
     const { preprocessCanvas } = await import('./utils/canvasPreprocessing');
-    preprocessCanvas(strokes, mainCanvasRef.current!);
+    const { base64 } = preprocessCanvas(strokes, mainCanvasRef.current!);
 
-    setTimeout(() => {
-      setResponseText('Demo mode: Canvas exported. Connect backend for AI recognition.');
-      setIsSubmitting(false);
-    }, 1000);
-  }, [strokes, isSubmitting]);
+    // Add a drawing marker + empty AI placeholder to the conversation
+    setMessages(prev => [
+      ...prev,
+      { role: 'user', content: 'Submitted a sketch', isDrawing: true, timestamp: Date.now() },
+      { role: 'assistant', content: '', timestamp: Date.now() },
+    ]);
+    setIsStreaming(true);
 
-  // Process hand landmarks
+    const abort = streamRecognition(base64, mode, sessionId, {
+      onSession: (id) => setSessionId(id),
+      onConfidence: (lvl) => setConfidence(lvl),
+      onToken: (text) => {
+        setMessages(prev => {
+          const updated = [...prev];
+          const last = updated[updated.length - 1];
+          if (last?.role === 'assistant') {
+            updated[updated.length - 1] = { ...last, content: last.content + text };
+          }
+          return updated;
+        });
+      },
+      onDone: () => {
+        setIsStreaming(false);
+        setIsSubmitting(false);
+        abortStreamRef.current = null;
+      },
+      onError: (msg) => {
+        setMessages(prev => {
+          const updated = [...prev];
+          const last = updated[updated.length - 1];
+          if (last?.role === 'assistant' && !last.content) {
+            updated[updated.length - 1] = { ...last, content: `Error: ${msg}` };
+          }
+          return updated;
+        });
+        setIsStreaming(false);
+        setIsSubmitting(false);
+        abortStreamRef.current = null;
+      },
+    });
+
+    abortStreamRef.current = abort;
+  }, [strokes, isSubmitting, sessionId, mode]);
+
+  // ── Follow-up question ───────────────────────────────────────────────────────
+  const handleFollowUp = useCallback((text: string) => {
+    if (!sessionId || isStreaming || isSubmitting) return;
+
+    setConfidence(null);
+
+    if (abortStreamRef.current) {
+      abortStreamRef.current();
+      abortStreamRef.current = null;
+    }
+
+    setMessages(prev => [
+      ...prev,
+      { role: 'user', content: text, timestamp: Date.now() },
+      { role: 'assistant', content: '', timestamp: Date.now() },
+    ]);
+    setIsStreaming(true);
+
+    const abort = streamFollowUp(sessionId, text, {
+      onConfidence: (lvl) => setConfidence(lvl),
+      onToken: (t) => {
+        setMessages(prev => {
+          const updated = [...prev];
+          const last = updated[updated.length - 1];
+          if (last?.role === 'assistant') {
+            updated[updated.length - 1] = { ...last, content: last.content + t };
+          }
+          return updated;
+        });
+      },
+      onDone: () => {
+        setIsStreaming(false);
+        abortStreamRef.current = null;
+      },
+      onError: (msg) => {
+        setMessages(prev => {
+          const updated = [...prev];
+          const last = updated[updated.length - 1];
+          if (last?.role === 'assistant' && !last.content) {
+            updated[updated.length - 1] = { ...last, content: `Error: ${msg}` };
+          }
+          return updated;
+        });
+        setIsStreaming(false);
+        abortStreamRef.current = null;
+      },
+    });
+
+    abortStreamRef.current = abort;
+  }, [sessionId, isStreaming, isSubmitting]);
+
+  // ── Process hand landmarks ───────────────────────────────────────────────────
   const processHands = useCallback((lm: Array<{ x: number; y: number; z?: number }>, gesture: Gesture) => {
     const { width, height } = canvasSizeRef.current;
     const indexTip = lm[LANDMARKS.INDEX_TIP];
     if (indexTip && width > 0 && height > 0) {
-      // Since video is mirrored, hand on left of video = user's right side
       lastIndexTipRef.current = { x: (1 - indexTip.x) * width, y: indexTip.y * height };
+    }
+
+    // Compute palm center (midpoint of wrist and middle finger MCP)
+    const wrist = lm[LANDMARKS.WRIST];
+    const middleMCP = lm[LANDMARKS.MIDDLE_MCP];
+    if (wrist && middleMCP && width > 0 && height > 0) {
+      palmCenterRef.current = {
+        x: (1 - (wrist.x + middleMCP.x) / 2) * width,
+        y: ((wrist.y + middleMCP.y) / 2) * height,
+      };
     }
 
     const prevGesture = lastGestureRef.current;
     lastGestureRef.current = gesture;
     setGesture(gesture);
 
-    // Handle gesture changes
     if (gesture === 'draw' && prevGesture !== 'draw') {
       if (lastIndexTipRef.current) {
         startStroke(lastIndexTipRef.current, strokeColor, strokeWidth);
@@ -252,14 +413,49 @@ function App() {
       addPoint(lastIndexTipRef.current);
     } else if (gesture === 'idle' && isDrawingRef.current) {
       endStroke();
-    } else if (gesture === 'erase' && strokes.length > 0) {
-      clear();
+    } else if (gesture === 'erase' && palmCenterRef.current) {
+      eraseNearPoint(palmCenterRef.current);
     } else if (gesture === 'submit' && prevGesture !== 'submit') {
       handleSubmit();
     }
-  }, [strokeColor, strokeWidth, startStroke, addPoint, endStroke, clear, handleSubmit, strokes.length]);
+  }, [strokeColor, strokeWidth, startStroke, addPoint, endStroke, eraseNearPoint, handleSubmit]);
 
-  // Initialize MediaPipe Hands
+  // ── Keep onResultsRef current ─────────────────────────────────────────────────
+  // Runs after every render (no deps array) so the ref always holds the latest
+  // closures, without MediaPipe needing to re-register or re-initialize.
+  useEffect(() => {
+    onResultsRef.current = (results: any) => {
+      const overlayCanvas = overlayCanvasRef.current;
+      if (!overlayCanvas) return;
+      const ctx = overlayCanvas.getContext('2d');
+      if (!ctx) return;
+
+      const rect = overlayCanvas.getBoundingClientRect();
+      if (overlayCanvas.width !== rect.width || overlayCanvas.height !== rect.height) {
+        overlayCanvas.width = rect.width;
+        overlayCanvas.height = rect.height;
+      }
+      canvasSizeRef.current = { width: rect.width, height: rect.height };
+
+      ctx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+
+      if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+        const lm = results.multiHandLandmarks[0];
+        drawHandSkeleton(ctx, lm);
+        const gesture = classifyGesture(lm);
+        processHands(lm, gesture);
+      } else {
+        if (lastGestureRef.current !== 'idle') {
+          lastGestureRef.current = 'idle';
+          setGesture('idle');
+          thumbsUpStartRef.current = null;
+          if (isDrawingRef.current) endStroke();
+        }
+      }
+    };
+  });
+
+  // ── Initialize MediaPipe Hands ───────────────────────────────────────────────
   useEffect(() => {
     const initHands = async () => {
       try {
@@ -283,13 +479,12 @@ function App() {
           attempts++;
         }
 
-        if (!(window as any).Hands) {
-          throw new Error('Failed to load MediaPipe Hands');
-        }
+        if (!(window as any).Hands) throw new Error('Failed to load MediaPipe Hands');
 
         const Hands = (window as any).Hands;
         handsInstanceRef.current = new Hands({
-          locateFile: (file: string) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/${file}`,
+          locateFile: (file: string) =>
+            `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/${file}`,
         });
 
         handsInstanceRef.current.setOptions({
@@ -299,42 +494,13 @@ function App() {
           minTrackingConfidence: 0.5,
         });
 
+        // Delegate to the ref so MediaPipe never needs to re-register this
+        // callback — all volatile closures are captured inside onResultsRef.
         handsInstanceRef.current.onResults((results: any) => {
-          const overlayCanvas = overlayCanvasRef.current;
-          if (!overlayCanvas) return;
-
-          const ctx = overlayCanvas.getContext('2d');
-          if (!ctx) return;
-
-          // Update canvas size
-          const rect = overlayCanvas.getBoundingClientRect();
-          if (overlayCanvas.width !== rect.width || overlayCanvas.height !== rect.height) {
-            overlayCanvas.width = rect.width;
-            overlayCanvas.height = rect.height;
-          }
-          canvasSizeRef.current = { width: rect.width, height: rect.height };
-
-          ctx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
-
-          if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
-            const lm = results.multiHandLandmarks[0];
-            drawHandSkeleton(ctx, lm);
-            const gesture = classifyGesture(lm);
-            processHands(lm, gesture);
-          } else {
-            if (lastGestureRef.current !== 'idle') {
-              lastGestureRef.current = 'idle';
-              setGesture('idle');
-              thumbsUpStartRef.current = null;
-              if (isDrawingRef.current) {
-                endStroke();
-              }
-            }
-          }
+          onResultsRef.current(results);
         });
 
         setHandsReady(true);
-        console.log('MediaPipe Hands ready');
       } catch (err) {
         console.error('Failed to initialize:', err);
         setError('Failed to load hand tracking');
@@ -344,26 +510,27 @@ function App() {
     initHands();
 
     return () => {
-      if (handsInstanceRef.current) {
-        handsInstanceRef.current.close();
-      }
+      if (handsInstanceRef.current) handsInstanceRef.current.close();
     };
-  }, [drawHandSkeleton, classifyGesture, processHands, endStroke]);
+  }, []); // run once — all volatile callbacks are accessed via onResultsRef
 
-  // Start camera
+  // ── Start camera ─────────────────────────────────────────────────────────────
   useEffect(() => {
     const startCamera = async () => {
       try {
         const stream = await navigator.mediaDevices.getUserMedia({
           video: { width: 640, height: 480, facingMode: 'user' },
         });
-
         if (videoRef.current) {
           videoRef.current.srcObject = stream;
           videoRef.current.onloadedmetadata = async () => {
             await videoRef.current!.play();
             setCameraReady(true);
           };
+        }
+        if (pipVideoRef.current) {
+          pipVideoRef.current.srcObject = stream;
+          pipVideoRef.current.play().catch(() => {});
         }
       } catch (err) {
         console.error('Camera error:', err);
@@ -380,14 +547,13 @@ function App() {
     };
   }, []);
 
-  // Process video frames (throttled to ~30fps for smoother drawing)
+  // ── Video frame loop (~30 fps) ────────────────────────────────────────────────
   useEffect(() => {
     if (!cameraReady || !handsReady) return;
 
     let animFrame: number;
     let lastTime = 0;
-    const targetFPS = 30;
-    const interval = 1000 / targetFPS;
+    const interval = 1000 / 30;
 
     const processFrame = async (timestamp: number) => {
       if (timestamp - lastTime >= interval) {
@@ -395,27 +561,20 @@ function App() {
         if (videoRef.current && handsInstanceRef.current && videoRef.current.readyState >= 2) {
           try {
             await handsInstanceRef.current.send({ image: videoRef.current });
-          } catch (e) {
-            // Ignore errors
-          }
+          } catch { /* ignore */ }
         }
       }
       animFrame = requestAnimationFrame(processFrame);
     };
 
     processFrame(0);
-
-    return () => {
-      if (animFrame) cancelAnimationFrame(animFrame);
-    };
+    return () => { if (animFrame) cancelAnimationFrame(animFrame); };
   }, [cameraReady, handsReady]);
 
-  // Render strokes when they change
-  useEffect(() => {
-    renderStrokes();
-  }, [renderStrokes]);
+  // ── Render strokes ────────────────────────────────────────────────────────────
+  useEffect(() => { renderStrokes(); }, [renderStrokes]);
 
-  // Handle resize
+  // ── Resize ────────────────────────────────────────────────────────────────────
   useEffect(() => {
     const updateSize = () => {
       if (containerRef.current) {
@@ -423,13 +582,12 @@ function App() {
         canvasSizeRef.current = { width: rect.width, height: rect.height };
       }
     };
-
     updateSize();
     window.addEventListener('resize', updateSize);
     return () => window.removeEventListener('resize', updateSize);
   }, []);
 
-  // Keyboard shortcuts
+  // ── Keyboard shortcuts ────────────────────────────────────────────────────────
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key === 'z') {
@@ -437,17 +595,16 @@ function App() {
         undo();
       }
     };
-
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [undo]);
 
   const getGestureColor = () => {
     switch (gesture) {
-      case 'draw': return '#00e5ff';
-      case 'erase': return '#f59e0b';
+      case 'draw':   return '#00e5ff';
+      case 'erase':  return '#f59e0b';
       case 'submit': return '#10b981';
-      default: return '#64748b';
+      default:       return '#64748b';
     }
   };
 
@@ -519,7 +676,7 @@ function App() {
           </div>
 
           <div className="absolute bottom-4 left-4 w-48 h-36 rounded-xl overflow-hidden glass border border-white/10 z-10">
-            <video ref={videoRef} className="w-full h-full object-cover" style={{ transform: 'scaleX(-1)' }} playsInline muted />
+            <video ref={pipVideoRef} className="w-full h-full object-cover" style={{ transform: 'scaleX(-1)' }} playsInline muted />
             <div
               className="absolute bottom-2 right-2 px-2 py-1 rounded-full text-[10px] font-bold uppercase"
               style={{ backgroundColor: `${getGestureColor()}30`, color: getGestureColor() }}
@@ -539,7 +696,14 @@ function App() {
             isLoading={false}
             hasEnoughStrokes={strokes.length >= 10}
           />
-          <ResponsePanel responseText={responseText} isStreaming={isStreaming} />
+          <ResponsePanel
+            messages={messages}
+            isStreaming={isStreaming}
+            isSubmitting={isSubmitting}
+            sessionId={sessionId}
+            confidence={confidence}
+            onFollowUp={handleFollowUp}
+          />
         </div>
       </div>
 
